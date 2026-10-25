@@ -5,9 +5,11 @@ package plugins
 import (
 	"gobot/internal/plugin"
 	"gobot/internal/plugins/calc"
+	"gobot/internal/plugins/units"
 )
 
 // All is every plugin a bot registers, in load order.
 var All = []plugin.Plugin{
 	calc.New(),
+	units.New(),
 }

@@ -36,6 +36,10 @@ Single test: `go test ./internal/bot -run TestReplyPing`, or
 - `internal/plugins/calc/` is the reference plugin: a scientific calculator with
   its own tokenizer and recursive-descent parser (`eval.go`), its function table
   (`funcs.go`), and its stateful `calc` command (`calc.go`).
+- `internal/plugins/units/` is a second, stateless plugin: `convert` resolves
+  unit expressions such as `km/h` or `ft^2` (`parse.go`) against a table of units
+  that each carry a scale and a dimension vector (`unit.go`), so compound and
+  derived units work without special cases.
 - `Bot.Reply(line string) string` is pure line-in/response-out with no I/O — put
   testable logic there. `Bot.Run(in, out)` owns all I/O (prompts, `exit`/`quit`,
   EOF handling).
