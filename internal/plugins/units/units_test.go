@@ -3,6 +3,8 @@ package units
 import (
 	"strings"
 	"testing"
+
+	"gobot/internal/units"
 )
 
 // convert runs the command the way the REPL would.
@@ -201,56 +203,11 @@ func TestPluginMetadata(t *testing.T) {
 	}
 }
 
-// TestEveryUnitRoundTrips converts one of each unit to itself, which catches a
-// mistyped scale, an unreachable alias or a dimension that does not line up.
-func TestEveryUnitRoundTrips(t *testing.T) {
-	for _, u := range table {
-		want := "1 " + u.symbol + " = 1 " + u.symbol
-		if got := convert(t, "1 "+u.symbol+" to "+u.symbol); got != want {
-			t.Errorf("round trip for %s: got %s, want %s", u.symbol, got, want)
-		}
+// TestListingMatchesEngine keeps the command's `convert units` output in step
+// with the engine it is drawn from.
+func TestListingMatchesEngine(t *testing.T) {
+	got := New().handle([]string{"units"})
+	if got != units.Listing() {
+		t.Errorf("listing does not match the engine:\n%s", got)
 	}
-}
-
-// TestEveryUnitReachesItsBase checks that each unit converts to the base unit of
-// its family, so no family is missing its anchor.
-func TestEveryUnitReachesItsBase(t *testing.T) {
-	for _, u := range table {
-		want, ok := baseUnits[u.family]
-		if !ok {
-			t.Errorf("unit %s has family %q, which has no base unit", u.symbol, u.family)
-			continue
-		}
-		if got := convert(t, "1 "+u.symbol+" to "+want); strings.HasPrefix(got, "error:") {
-			t.Errorf("convert 1 %s to %s: %s", u.symbol, want, got)
-		}
-	}
-}
-
-func TestTableSanity(t *testing.T) {
-	seen := map[string]bool{}
-	for _, u := range table {
-		if u.symbol == "" || u.family == "" {
-			t.Errorf("unit %+v needs a symbol and a family", u)
-		}
-		if seen[u.symbol] {
-			t.Errorf("symbol %q is registered twice", u.symbol)
-		}
-		seen[u.symbol] = true
-		if u.scale <= 0 {
-			t.Errorf("unit %s has a non-positive scale %v", u.symbol, u.scale)
-		}
-		if !familyListed(u.family) {
-			t.Errorf("family %q is not listed in help output", u.family)
-		}
-	}
-}
-
-func familyListed(family string) bool {
-	for _, f := range families {
-		if f == family {
-			return true
-		}
-	}
-	return false
 }

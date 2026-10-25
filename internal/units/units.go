@@ -1,11 +1,11 @@
-// Package units provides a unit conversion plugin for gobot.
+// Package units is the unit-conversion engine shared by the convert and calc
+// plugins.
 //
-// The `convert` command turns "<amount> <from> to <to>" into a result, where a
-// unit is a scale factor over a base unit plus a dimension vector. Because
-// dimensions are tracked as exponent vectors, compound units fall out of the
-// same arithmetic: km/h, m/s^2 and ft^2 all convert without special cases.
-// Temperature units are affine (they carry offsets, not just a scale), so they
-// are only allowed as whole units.
+// Every unit carries a scale and a dimension vector over six base dimensions,
+// so compound and derived units — km/h, m/s^2, ft^2, lb/ft^3 — are arithmetic
+// on exponent vectors rather than special cases. A Unit is a product of named
+// units with integer exponents, which lets a result be printed in the units it
+// was actually computed from.
 package units
 
 import (
@@ -15,47 +15,47 @@ import (
 	"strings"
 )
 
-// dims is an exponent vector over the base dimensions. Everything else — area,
+// Dims is an exponent vector over the base dimensions. Everything else — area,
 // speed, energy — is expressed in terms of these six, which is what makes
 // compound units and mismatch errors work.
-type dims struct {
-	length, mass, time, temp, data, angle int
+type Dims struct {
+	Length, Mass, Time, Temp, Data, Angle int
 }
 
 // add returns d + n*o.
-func (d dims) add(o dims, n int) dims {
-	return dims{
-		length: d.length + n*o.length,
-		mass:   d.mass + n*o.mass,
-		time:   d.time + n*o.time,
-		temp:   d.temp + n*o.temp,
-		data:   d.data + n*o.data,
-		angle:  d.angle + n*o.angle,
+func (d Dims) add(o Dims, n int) Dims {
+	return Dims{
+		Length: d.Length + n*o.Length,
+		Mass:   d.Mass + n*o.Mass,
+		Time:   d.Time + n*o.Time,
+		Temp:   d.Temp + n*o.Temp,
+		Data:   d.Data + n*o.Data,
+		Angle:  d.Angle + n*o.Angle,
 	}
 }
 
 var (
-	dimLength   = dims{length: 1}
-	dimMass     = dims{mass: 1}
-	dimTime     = dims{time: 1}
-	dimTemp     = dims{temp: 1}
-	dimData     = dims{data: 1}
-	dimAngle    = dims{angle: 1}
-	dimNone     = dims{}
-	dimArea     = dims{length: 2}
-	dimVolume   = dims{length: 3}
-	dimSpeed    = dims{length: 1, time: -1}
-	dimAccel    = dims{length: 1, time: -2}
-	dimFreq     = dims{time: -1}
-	dimForce    = dims{mass: 1, length: 1, time: -2}
-	dimEnergy   = dims{mass: 1, length: 2, time: -2}
-	dimPower    = dims{mass: 1, length: 2, time: -3}
-	dimPressure = dims{mass: 1, length: -1, time: -2}
+	dimLength   = Dims{Length: 1}
+	dimMass     = Dims{Mass: 1}
+	dimTime     = Dims{Time: 1}
+	dimTemp     = Dims{Temp: 1}
+	dimData     = Dims{Data: 1}
+	dimAngle    = Dims{Angle: 1}
+	dimNone     = Dims{}
+	dimArea     = Dims{Length: 2}
+	dimVolume   = Dims{Length: 3}
+	dimSpeed    = Dims{Length: 1, Time: -1}
+	dimAccel    = Dims{Length: 1, Time: -2}
+	dimFreq     = Dims{Time: -1}
+	dimForce    = Dims{Mass: 1, Length: 1, Time: -2}
+	dimEnergy   = Dims{Mass: 1, Length: 2, Time: -2}
+	dimPower    = Dims{Mass: 1, Length: 2, Time: -3}
+	dimPressure = Dims{Mass: 1, Length: -1, Time: -2}
 )
 
-// dimNames gives the common derived dimensions a readable name. Anything not
-// listed is rendered from its exponents by dims.String.
-var dimNames = map[dims]string{
+// dimNames gives the common derived dimensions a readable name, so an error can
+// say "pressure" instead of an exponent vector.
+var dimNames = map[Dims]string{
 	dimNone:     "dimensionless",
 	dimLength:   "length",
 	dimMass:     "mass",
@@ -74,32 +74,32 @@ var dimNames = map[dims]string{
 	dimPressure: "pressure",
 }
 
-var baseDimNames = []struct {
+var baseDims = []struct {
 	name string
-	get  func(dims) int
-	set  func(*dims, int)
+	get  func(Dims) int
+	sym  string
 }{
-	{"length", func(d dims) int { return d.length }, func(d *dims, n int) { d.length = n }},
-	{"mass", func(d dims) int { return d.mass }, func(d *dims, n int) { d.mass = n }},
-	{"time", func(d dims) int { return d.time }, func(d *dims, n int) { d.time = n }},
-	{"temperature", func(d dims) int { return d.temp }, func(d *dims, n int) { d.temp = n }},
-	{"data", func(d dims) int { return d.data }, func(d *dims, n int) { d.data = n }},
-	{"angle", func(d dims) int { return d.angle }, func(d *dims, n int) { d.angle = n }},
+	{"length", func(d Dims) int { return d.Length }, "m"},
+	{"mass", func(d Dims) int { return d.Mass }, "kg"},
+	{"time", func(d Dims) int { return d.Time }, "s"},
+	{"temperature", func(d Dims) int { return d.Temp }, "K"},
+	{"data", func(d Dims) int { return d.Data }, "bit"},
+	{"angle", func(d Dims) int { return d.Angle }, "rad"},
 }
 
 // String names a dimension vector, e.g. "energy" or "mass/(length*time^2)".
-func (d dims) String() string {
+func (d Dims) String() string {
 	if name, ok := dimNames[d]; ok {
 		return name
 	}
 	var pos, neg []string
-	for _, b := range baseDimNames {
+	for _, b := range baseDims {
 		switch e := b.get(d); {
 		case e == 0:
 		case e > 0:
-			pos = append(pos, term(b.name, e))
+			pos = append(pos, dimTerm(b.name, e))
 		default:
-			neg = append(neg, term(b.name, -e))
+			neg = append(neg, dimTerm(b.name, -e))
 		}
 	}
 	switch {
@@ -118,7 +118,7 @@ func (d dims) String() string {
 	}
 }
 
-func term(name string, exp int) string {
+func dimTerm(name string, exp int) string {
 	if exp == 1 {
 		return name
 	}
@@ -132,7 +132,7 @@ type unit struct {
 	family  string
 	symbol  string
 	aliases []string
-	dims    dims
+	dims    Dims
 	scale   float64
 	pre     float64
 	post    float64
@@ -141,12 +141,6 @@ type unit struct {
 // affine reports whether converting through this unit needs offsets, which only
 // works when the unit stands alone rather than inside a compound expression.
 func (u *unit) affine() bool { return u.pre != 0 || u.post != 0 }
-
-// toBase converts a value measured in this unit into base units.
-func (u *unit) toBase(v float64) float64 { return (v+u.pre)*u.scale + u.post }
-
-// fromBase is the inverse of toBase.
-func (u *unit) fromBase(v float64) float64 { return (v-u.post)/u.scale - u.pre }
 
 // prefixes are accepted in front of a unit name: SI decades plus the binary
 // multipliers for data. Lookup tries them longest-first so "dam" is deca-metre
@@ -159,10 +153,6 @@ var prefixes = map[string]float64{
 	"Ki": 1 << 10, "Mi": 1 << 20, "Gi": 1 << 30, "Ti": 1 << 40, "Pi": 1 << 50,
 }
 
-// prefixOrder lists the prefixes longest-first, so a two-letter prefix wins the
-// tie against a one-letter one.
-var prefixOrder = sortedKeysByLength(prefixes)
-
 // wordPrefixes are the spelled-out decades, so "kilometres" and "megabytes"
 // resolve the same way their abbreviated forms do.
 var wordPrefixes = map[string]float64{
@@ -174,8 +164,10 @@ var wordPrefixes = map[string]float64{
 	"kibi": 1 << 10, "mebi": 1 << 20, "gibi": 1 << 30, "tebi": 1 << 40, "pebi": 1 << 50,
 }
 
-// wordPrefixOrder lists the spelled-out prefixes longest-first.
-var wordPrefixOrder = sortedKeysByLength(wordPrefixes)
+var (
+	prefixOrder     = sortedKeysByLength(prefixes)
+	wordPrefixOrder = sortedKeysByLength(wordPrefixes)
+)
 
 func sortedKeysByLength[V any](m map[string]V) []string {
 	out := make([]string, 0, len(m))
@@ -197,10 +189,10 @@ var table = buildTable()
 
 func buildTable() []*unit {
 	var us []*unit
-	add := func(family string, d dims, scale float64, symbol string, aliases ...string) {
+	add := func(family string, d Dims, scale float64, symbol string, aliases ...string) {
 		us = append(us, &unit{family: family, dims: d, scale: scale, symbol: symbol, aliases: aliases})
 	}
-	addAffine := func(family string, d dims, scale, pre, post float64, symbol string, aliases ...string) {
+	addAffine := func(family string, d Dims, scale, pre, post float64, symbol string, aliases ...string) {
 		us = append(us, &unit{family: family, dims: d, scale: scale, pre: pre, post: post, symbol: symbol, aliases: aliases})
 	}
 
@@ -400,9 +392,9 @@ func singular(name string) string {
 	return name
 }
 
-// suggest guesses what a misspelled unit meant, for a helpful error message. It
+// Suggest guesses what a misspelled unit meant, for a helpful error message. It
 // stays quiet for real unit names and for anything too far from a known symbol.
-func suggest(name string) string {
+func Suggest(name string) string {
 	if _, _, ok := lookup(name); ok {
 		return ""
 	}
@@ -447,16 +439,16 @@ var families = []string{
 	"angle", "frequency", "energy", "power", "pressure", "force",
 }
 
-// baseUnits names the anchor of each family: converting to it expresses a value
+// BaseUnits names the anchor of each family: converting to it expresses a value
 // in that family's base units.
-var baseUnits = map[string]string{
+var BaseUnits = map[string]string{
 	"length": "m", "mass": "kg", "time": "s", "temperature": "K", "area": "m^2",
 	"volume": "m^3", "speed": "m/s", "data": "bit", "angle": "rad",
 	"frequency": "Hz", "energy": "J", "power": "W", "pressure": "Pa", "force": "N",
 }
 
-// listing renders one line per family with its base unit and symbols.
-func listing() string {
+// Listing renders one line per family with its base unit and symbols.
+func Listing() string {
 	byFamily := make(map[string][]string, len(families))
 	for _, u := range table {
 		byFamily[u.family] = append(byFamily[u.family], u.symbol)
@@ -465,7 +457,7 @@ func listing() string {
 	for _, family := range families {
 		units := byFamily[family]
 		sort.Strings(units)
-		label := family + " (base " + baseUnits[family] + ")"
+		label := family + " (base " + BaseUnits[family] + ")"
 		fmt.Fprintf(&b, "%-24s %s\n", label, strings.Join(units, ", "))
 	}
 	return strings.TrimSuffix(b.String(), "\n")

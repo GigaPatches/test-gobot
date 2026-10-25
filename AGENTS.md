@@ -33,13 +33,23 @@ Single test: `go test ./internal/bot -run TestReplyPing`, or
   only `main.go` wires them together.
 - `internal/plugins/plugins.go` holds `All`, the ordered list of plugins a bot
   loads. Adding a plugin means adding one line there.
+- `internal/units/` is the measurement engine, shared by two plugins and free of
+  plugin code. Every unit carries a scale and a dimension vector over six base
+  dimensions (`units.go`), so compound and derived units — `km/h`, `ft^2`,
+  `lb/ft^3` — are arithmetic on exponent vectors rather than special cases.
+  `unit.go` adds `Unit`, a product of named units with integer exponents, which
+  is what lets a computed result be printed in the units it came from.
 - `internal/plugins/calc/` is the reference plugin: a scientific calculator with
   its own tokenizer and recursive-descent parser (`eval.go`), its function table
-  (`funcs.go`), and its stateful `calc` command (`calc.go`).
-- `internal/plugins/units/` is a second, stateless plugin: `convert` resolves
-  unit expressions such as `km/h` or `ft^2` (`parse.go`) against a table of units
-  that each carry a scale and a dimension vector (`unit.go`), so compound and
-  derived units work without special cases.
+  (`funcs.go`), its stateful `calc` command (`calc.go`), and `quantity.go`, where
+  values carry units through arithmetic (`100 km / 2 h` is `50 km/h`) and the
+  `to` operator converts (`calc 10 km to mi`).
+- `internal/plugins/units/` is a second, stateless plugin: `convert` is a thin
+  wrapper over `internal/units`, splitting the request (`request.go`) and
+  formatting the answer. It adds no measurement logic of its own.
+- Plugins never import each other. When two of them want the same knowledge, the
+  knowledge moves to a plain library package that both import — which is why
+  `calc` can convert units without knowing anything about the `convert` command.
 - `Bot.Reply(line string) string` is pure line-in/response-out with no I/O — put
   testable logic there. `Bot.Run(in, out)` owns all I/O (prompts, `exit`/`quit`,
   EOF handling).
@@ -62,3 +72,12 @@ Single test: `go test ./internal/bot -run TestReplyPing`, or
   for instance) free of locking so they stay easy to test.
 - Plugins report user-facing failures as a returned `error: ...` string rather
   than panicking; only programming errors (duplicate command names) panic.
+- The calculator's math functions stay plain `float64` functions: how each one
+  treats a quantity is a separate `unitPolicy` on the table entry (`sin` takes an
+  angle, `abs` keeps the unit, `sqrt` divides its exponents). Keep the dimension
+  logic there rather than in the math, so both stay readable.
+- Two calculator rules worth knowing before changing the grammar: juxtaposition
+  binds tighter than `*` and `/` (that is what makes `100 km / 2 h` come out as
+  `50 km/h`), and a name that is both a function and a unit — `deg`, `rad`, `min`
+  — is the function only when `(` follows, so `deg(pi)` is a call and `45 deg` is
+  an angle.

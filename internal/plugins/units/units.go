@@ -1,20 +1,19 @@
 // Package units provides a unit conversion plugin for gobot.
 //
-// The `convert` command turns "<amount> <from> to <to>" into a result, where a
-// unit is a scale factor over a base unit plus a dimension vector. Because
-// dimensions are tracked as exponent vectors, compound units fall out of the
-// same arithmetic: km/h, m/s^2 and ft^2 all convert without special cases.
-// Temperature units are affine (they carry offsets, not just a scale), so they
-// are only allowed as whole units.
+// The `convert` command turns "<amount> <from> to <to>" into a result. The work
+// is done by the internal/units engine, which every unit carries as a scale
+// factor over a base unit plus a dimension vector. Because dimensions are
+// exponent vectors, compound units fall out of the same arithmetic: km/h, m/s^2
+// and ft^2 all convert without special cases. Temperature units are affine (they
+// carry offsets, not just a scale), so they are only allowed as whole units.
 package units
 
 import (
-	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 
 	"gobot/internal/plugin"
+	"gobot/internal/units"
 )
 
 // Plugin converts between units of measurement. It keeps no state: every
@@ -58,12 +57,14 @@ func (p *Plugin) handle(args []string) string {
 	case "help", "?":
 		return helpText
 	case "units", "list":
-		return listing()
+		return units.Listing()
 	}
 	return p.convert(strings.Join(args, " "))
 }
 
-// convert answers one conversion request, formatted as "from = to".
+// convert answers one conversion request, formatted as "from = to". The units
+// are echoed as they were typed, so `convert 1 mile to metres` repeats both
+// spellings back rather than canonicalising them.
 func (p *Plugin) convert(line string) string {
 	left, right, err := splitConversion(line)
 	if err != nil {
@@ -73,69 +74,19 @@ func (p *Plugin) convert(line string) string {
 	if err != nil {
 		return "error: " + err.Error()
 	}
-	from, err := parseUnitExpr(fromText)
+	from, err := units.Parse(fromText)
 	if err != nil {
 		return "error: " + err.Error()
 	}
-	to, err := parseUnitExpr(right)
+	to, err := units.Parse(right)
 	if err != nil {
 		return "error: " + err.Error()
 	}
-	if from.dims != to.dims {
-		return fmt.Sprintf("error: cannot convert %s (%s) to %s (%s)",
-			fromText, from.dims, right, to.dims)
+	out, err := from.ConvertTo(to, amount)
+	if err != nil {
+		return "error: " + err.Error()
 	}
-	base := (amount+from.pre)*from.factor + from.post
-	out := (base-to.post)/to.factor - to.pre
 	return fmt.Sprintf("%s %s = %s %s", formatValue(amount), fromText, formatValue(out), right)
-}
-
-// separators are the words that split the two sides of a request; the arrows are
-// handled separately because they are often typed without spaces.
-var separators = map[string]bool{"to": true, "into": true, "as": true}
-
-// splitConversion finds the two sides of a request. Arrows split the line even
-// when typed without spaces; word separators split it on whole words. Without
-// any separator the final word is taken as the target, so `convert 10 km mi`
-// works too.
-func splitConversion(line string) (string, string, error) {
-	for _, arrow := range []string{"->", "=>", "→"} {
-		i := strings.Index(line, arrow)
-		if i < 0 {
-			continue
-		}
-		left, right := strings.TrimSpace(line[:i]), strings.TrimSpace(line[i+len(arrow):])
-		if left == "" {
-			return "", "", fmt.Errorf("nothing to convert")
-		}
-		if right == "" {
-			return "", "", fmt.Errorf("nothing to convert to")
-		}
-		return left, right, nil
-	}
-	fields := strings.Fields(line)
-	for i, field := range fields {
-		if !separators[strings.ToLower(field)] {
-			continue
-		}
-		if i == 0 {
-			return "", "", fmt.Errorf("nothing to convert")
-		}
-		if i == len(fields)-1 {
-			return "", "", fmt.Errorf("nothing to convert to")
-		}
-		return strings.Join(fields[:i], " "), strings.Join(fields[i+1:], " "), nil
-	}
-	if len(fields) < 3 {
-		return "", "", errors.New(usage)
-	}
-	return strings.Join(fields[:len(fields)-1], " "), fields[len(fields)-1], nil
-}
-
-// formatValue renders a result the way a calculator would: no trailing zeros,
-// and enough rounding to hide float64 noise.
-func formatValue(v float64) string {
-	return strconv.FormatFloat(v, 'g', 12, 64)
 }
 
 const usage = "usage: convert <amount> <unit> to <unit> — try `convert help`"
@@ -164,4 +115,4 @@ syntax:
   temperature scales convert only as whole units, not inside a compound one
 
 units by family:
-` + listing()
+` + units.Listing()

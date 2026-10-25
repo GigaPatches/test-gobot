@@ -4,7 +4,11 @@
 // tokenizer and recursive-descent parser: operator precedence, right
 // associative exponentiation, postfix factorials, implicit multiplication
 // (2pi), named constants, a library of math functions, user variables, a
-// deg/rad angle mode, and a result history. See `calc help`.
+// deg/rad angle mode, and a result history.
+//
+// Values also carry units of measurement, taken from the internal/units engine
+// the convert plugin shares: 100 km / 2 h is 5 km/h, 5 m + 3 ft is 5.9144 m, and
+// `to` converts a result, so `calc 10 km to mi` works too. See `calc help`.
 package calc
 
 import (
@@ -22,7 +26,7 @@ const HistoryLen = 20
 // table, the angle mode, and the result history.
 type Plugin struct {
 	mu      sync.Mutex
-	vars    map[string]float64
+	vars    map[string]quantity
 	mode    angleMode
 	history []entry
 	count   int // total results produced, used to number history entries
@@ -37,7 +41,7 @@ type entry struct {
 // New returns a calculator with an empty variable table, radian mode, and no
 // history. Each call is fully independent of any other.
 func New() *Plugin {
-	return &Plugin{vars: make(map[string]float64), mode: rad}
+	return &Plugin{vars: make(map[string]quantity), mode: rad}
 }
 
 // Name implements plugin.Plugin.
@@ -79,7 +83,7 @@ func (p *Plugin) handle(args []string) string {
 	case "hist", "history":
 		return p.listHistory()
 	case "clear":
-		p.vars = make(map[string]float64)
+		p.vars = make(map[string]quantity)
 		p.history = nil
 		p.count = 0
 		return "cleared variables and history"
@@ -104,7 +108,7 @@ func (p *Plugin) evaluate(src string) string {
 	if err != nil {
 		return "error: " + err.Error()
 	}
-	out := formatFloat(v)
+	out := v.String()
 	p.vars["ans"] = v
 	p.count++
 	p.history = append(p.history, entry{n: p.count, expr: src, result: out})
@@ -138,7 +142,7 @@ func (p *Plugin) listVars() string {
 	}
 	b.WriteString("\n")
 	for _, name := range sortedKeys(p.vars) {
-		fmt.Fprintf(&b, "%s = %s\n", name, formatFloat(p.vars[name]))
+		fmt.Fprintf(&b, "%s = %s\n", name, p.vars[name])
 	}
 	return strings.TrimSuffix(b.String(), "\n")
 }
@@ -167,10 +171,24 @@ func buildHelp() string {
 	var b strings.Builder
 	b.WriteString("scientific calculator — `calc <expression>`\n\n")
 	b.WriteString("operators: + - * / ^ (or **) % (remainder) ! (factorial), parentheses,\n")
-	b.WriteString("           implicit multiplication (2pi, 3(4)), right-associative ^\n")
+	b.WriteString("           implicit multiplication (2pi, 3(4), 10 km), right-associative ^\n")
+	b.WriteString("           juxtaposition binds tighter than * and /, so 100 km / 2 h is 50 km/h\n")
 	b.WriteString("constants: " + strings.Join(sortedKeys(constants), ", ") + "\n")
 	b.WriteString("variables: `calc x = 3` stores x, `ans` is the previous result\n")
 	b.WriteString("state:     `calc mode [deg|rad]`, `calc vars`, `calc hist`, `calc clear`\n\n")
+	b.WriteString("units:   numbers can carry units through arithmetic, and convert with\n")
+	b.WriteString("         to or ->:\n")
+	b.WriteString("           calc 10 km to mi          calc 100 km/h -> mph\n")
+	b.WriteString("           calc 5 m + 3 ft           calc 100 km / 2 h\n")
+	b.WriteString("           calc 2 kg * 3 m/s^2       calc sin(45 deg)\n")
+	b.WriteString("         a result keeps the units it was computed with, additions keep\n")
+	b.WriteString("         the left side's, and powers and roots work on units as well:\n")
+	b.WriteString("           calc (2 m)^2              calc sqrt(16 m^2)\n")
+	b.WriteString("         spellings keep their case (kB is a kilobyte, kb a kilobit).\n")
+	b.WriteString("         `convert units` lists every unit name. Adding two different\n")
+	b.WriteString("         temperature scales goes through kelvin, while one scale adds as\n")
+	b.WriteString("         it stands, so 5 C + 3 C is 8 C. deg, rad and min are functions\n")
+	b.WriteString("         when followed by ( and units otherwise.\n\n")
 	b.WriteString("functions:\n")
 	for _, name := range sortedKeys(funcs) {
 		fmt.Fprintf(&b, "  %s\n", funcs[name].doc)

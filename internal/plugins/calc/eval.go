@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf8"
+
+	"gobot/internal/units"
 )
 
 // angleMode decides how trigonometric functions read their input and report
@@ -41,17 +43,17 @@ func (m angleMode) fromRadians(x float64) float64 {
 
 // eval evaluates src against the plugin's variables and angle mode. It neither
 // locks the plugin nor records history: callers own both.
-func (p *Plugin) eval(src string) (float64, error) {
+func (p *Plugin) eval(src string) (quantity, error) {
 	pr, err := newParser(p, src)
 	if err != nil {
-		return 0, err
+		return quantity{}, err
 	}
 	v, err := pr.parseStmt()
 	if err != nil {
-		return 0, err
+		return quantity{}, err
 	}
 	if pr.peek().kind != tokEOF {
-		return 0, fmt.Errorf("unexpected %s", describe(pr.peek()))
+		return quantity{}, fmt.Errorf("unexpected %s", describe(pr.peek()))
 	}
 	return v, nil
 }
@@ -84,7 +86,8 @@ const (
 
 type token struct {
 	kind  tokKind
-	text  string
+	text  string // identifiers are folded to lowercase
+	raw   string // an identifier as typed, which is how a unit is spelled
 	value float64
 }
 
@@ -97,7 +100,7 @@ func describe(t token) string {
 }
 
 // operators are the single characters the grammar understands. ** is accepted
-// as a synonym for ^ while tokenizing.
+// as a synonym for ^ and -> as a synonym for the word to, while tokenizing.
 const operators = "+-*/^%!(),="
 
 func tokenize(s string) ([]token, error) {
@@ -119,10 +122,13 @@ func tokenize(s string) ([]token, error) {
 			for end < len(s) && isNameByte(s[end]) {
 				end++
 			}
-			toks = append(toks, token{kind: tokIdent, text: strings.ToLower(s[i:end])})
+			toks = append(toks, token{kind: tokIdent, text: strings.ToLower(s[i:end]), raw: s[i:end]})
 			i = end
 		case c == '*' && i+1 < len(s) && s[i+1] == '*':
 			toks = append(toks, token{kind: tokOp, text: "^"})
+			i += 2
+		case c == '-' && i+1 < len(s) && s[i+1] == '>':
+			toks = append(toks, token{kind: tokOp, text: "->"})
 			i += 2
 		case strings.IndexByte(operators, c) >= 0:
 			toks = append(toks, token{kind: tokOp, text: string(c)})
@@ -174,13 +180,18 @@ func isNameByte(c byte) bool {
 // parser is a recursive-descent parser for this grammar, lowest precedence
 // first:
 //
-//	stmt    := ident "=" expr | expr
-//	expr    := term (("+" | "-") term)*
-//	term    := unary (("*" | "/" | "%" | "mod" | implicit) unary)*
-//	unary   := ("+" | "-") unary | power
-//	power   := postfix ("^" unary)?          # right associative, -2^2 == -4
-//	postfix := primary ("!")*
-//	primary := number | constant | variable | func "(" args ")" | "(" expr ")"
+//	stmt     := ident "=" conv | conv
+//	conv     := expr [("to" | "->") expr]  # the right side supplies a target unit
+//	expr     := term (("+" | "-") term)*
+//	term     := product (("*" | "/" | "%" | "mod") product)*
+//	product  := unary (unary)*             # implicit multiplication binds tighter
+//	unary    := ("+" | "-") unary | power
+//	power    := postfix ("^" unary)?       # right associative, -2^2 == -4
+//	postfix  := primary ("!")*
+//	primary  := number | unit | constant | variable | func "(" args ")" | "(" conv ")"
+//
+// A name that is none of the known functions, variables or constants is tried as
+// a unit, which is what makes 10 km a quantity rather than an unknown name.
 type parser struct {
 	toks []token
 	pos  int
@@ -210,58 +221,93 @@ func (pr *parser) isOp(op string) bool {
 	return t.kind == tokOp && t.text == op
 }
 
-func (pr *parser) parseStmt() (float64, error) {
+func (pr *parser) parseStmt() (quantity, error) {
 	t := pr.peek()
 	if t.kind == tokIdent && pr.toks[pr.pos+1].kind == tokOp && pr.toks[pr.pos+1].text == "=" {
 		pr.next() // name
 		pr.next() // "="
 		if _, ok := constants[t.text]; ok {
-			return 0, fmt.Errorf("cannot assign to constant %q", t.text)
+			return quantity{}, fmt.Errorf("cannot assign to constant %q", t.text)
 		}
 		if _, ok := funcs[t.text]; ok {
-			return 0, fmt.Errorf("cannot assign to function %q", t.text)
+			return quantity{}, fmt.Errorf("cannot assign to function %q", t.text)
 		}
-		v, err := pr.parseExpr()
+		v, err := pr.parseConversion()
 		if err != nil {
-			return 0, err
+			return quantity{}, err
 		}
 		pr.p.vars[t.text] = v
 		return v, nil
 	}
-	return pr.parseExpr()
+	return pr.parseConversion()
 }
 
-func (pr *parser) parseExpr() (float64, error) {
+// parseConversion is a whole expression plus the optional `to <unit>` that
+// converts its result. The right-hand side is evaluated like any other
+// expression and only its unit is used, so `to mph`, `to mi/h` and `to km/h` all
+// work, and conversions chain: 10 km to mi to yd.
+func (pr *parser) parseConversion() (quantity, error) {
+	v, err := pr.parseExpr()
+	if err != nil {
+		return quantity{}, err
+	}
+	for pr.isConversion() {
+		pr.next()
+		target, err := pr.parseExpr()
+		if err != nil {
+			return quantity{}, err
+		}
+		if target.isPlain() {
+			return quantity{}, fmt.Errorf("expected a unit after \"to\", got %s", target)
+		}
+		if v, err = v.in(target.unit); err != nil {
+			return quantity{}, err
+		}
+	}
+	return v, nil
+}
+
+// isConversion reports the start of a `to <unit>` tail.
+func (pr *parser) isConversion() bool {
+	t := pr.peek()
+	return (t.kind == tokIdent && t.text == "to") || (t.kind == tokOp && t.text == "->")
+}
+
+func (pr *parser) parseExpr() (quantity, error) {
 	v, err := pr.parseTerm()
 	if err != nil {
-		return 0, err
+		return quantity{}, err
 	}
 	for {
 		switch {
 		case pr.isOp("+"):
 			pr.next()
-			var rhs float64
+			var rhs quantity
 			if rhs, err = pr.parseTerm(); err != nil {
-				return 0, err
+				return quantity{}, err
 			}
-			v += rhs
+			if v, err = v.add(rhs); err != nil {
+				return quantity{}, err
+			}
 		case pr.isOp("-"):
 			pr.next()
-			var rhs float64
+			var rhs quantity
 			if rhs, err = pr.parseTerm(); err != nil {
-				return 0, err
+				return quantity{}, err
 			}
-			v -= rhs
+			if v, err = v.sub(rhs); err != nil {
+				return quantity{}, err
+			}
 		default:
 			return v, nil
 		}
 	}
 }
 
-func (pr *parser) parseTerm() (float64, error) {
-	v, err := pr.parseUnary()
+func (pr *parser) parseTerm() (quantity, error) {
+	v, err := pr.parseProduct()
 	if err != nil {
-		return 0, err
+		return quantity{}, err
 	}
 	for {
 		var op string
@@ -271,38 +317,55 @@ func (pr *parser) parseTerm() (float64, error) {
 		case pr.peek().kind == tokIdent && pr.peek().text == "mod":
 			pr.next()
 			op = "mod"
-		case pr.startsPrimary():
-			op = "*" // implicit multiplication: 2pi, 3(4), (1+2)(3+4)
 		default:
 			return v, nil
 		}
-		rhs, err := pr.parseUnary()
+		rhs, err := pr.parseProduct()
 		if err != nil {
-			return 0, err
+			return quantity{}, err
 		}
 		switch op {
 		case "*":
-			v *= rhs
+			v = v.mul(rhs)
 		case "/":
-			if rhs == 0 {
-				return 0, errors.New("division by zero")
+			if v, err = v.div(rhs); err != nil {
+				return quantity{}, err
 			}
-			v /= rhs
 		case "%", "mod":
-			if rhs == 0 {
-				return 0, errors.New("modulo by zero")
+			if v, err = v.mod(rhs); err != nil {
+				return quantity{}, err
 			}
-			v = math.Mod(v, rhs)
 		}
 	}
 }
 
+// parseProduct collects implicit multiplication, which binds tighter than the
+// explicit operators: 100 km / 2 h divides 100 km by (2 h), the way it would be
+// written on paper, and comes out as 50 km/h.
+func (pr *parser) parseProduct() (quantity, error) {
+	v, err := pr.parseUnary()
+	if err != nil {
+		return quantity{}, err
+	}
+	for pr.startsPrimary() {
+		rhs, err := pr.parseUnary()
+		if err != nil {
+			return quantity{}, err
+		}
+		v = v.mul(rhs)
+	}
+	return v, nil
+}
+
 // startsPrimary reports whether the next token can begin a value, which is how
-// the term rule spots implicit multiplication.
+// the product rule spots implicit multiplication. The words "to" and "mod" are
+// left out: they are operators, not factors.
 func (pr *parser) startsPrimary() bool {
 	switch t := pr.peek(); t.kind {
-	case tokNum, tokIdent:
+	case tokNum:
 		return true
+	case tokIdent:
+		return t.text != "to" && t.text != "mod"
 	case tokOp:
 		return t.text == "("
 	default:
@@ -310,15 +373,16 @@ func (pr *parser) startsPrimary() bool {
 	}
 }
 
-func (pr *parser) parseUnary() (float64, error) {
+func (pr *parser) parseUnary() (quantity, error) {
 	switch {
 	case pr.isOp("-"):
 		pr.next()
 		v, err := pr.parseUnary()
 		if err != nil {
-			return 0, err
+			return quantity{}, err
 		}
-		return -v, nil
+		v.value = -v.value
+		return v, nil
 	case pr.isOp("+"):
 		pr.next()
 		return pr.parseUnary()
@@ -326,10 +390,10 @@ func (pr *parser) parseUnary() (float64, error) {
 	return pr.parsePower()
 }
 
-func (pr *parser) parsePower() (float64, error) {
+func (pr *parser) parsePower() (quantity, error) {
 	base, err := pr.parsePostfix()
 	if err != nil {
-		return 0, err
+		return quantity{}, err
 	}
 	if !pr.isOp("^") {
 		return base, nil
@@ -339,68 +403,90 @@ func (pr *parser) parsePower() (float64, error) {
 	// associative.
 	exp, err := pr.parseUnary()
 	if err != nil {
-		return 0, err
+		return quantity{}, err
 	}
-	return math.Pow(base, exp), nil
+	return base.pow(exp)
 }
 
-func (pr *parser) parsePostfix() (float64, error) {
+func (pr *parser) parsePostfix() (quantity, error) {
 	v, err := pr.parsePrimary()
 	if err != nil {
-		return 0, err
+		return quantity{}, err
 	}
 	for pr.isOp("!") {
 		pr.next()
-		if v, err = factorial(v); err != nil {
-			return 0, err
+		if !v.isPlain() {
+			return quantity{}, fmt.Errorf("factorial needs a plain number, not %s", v)
+		}
+		if v.value, err = factorial(v.value); err != nil {
+			return quantity{}, err
 		}
 	}
 	return v, nil
 }
 
-func (pr *parser) parsePrimary() (float64, error) {
+func (pr *parser) parsePrimary() (quantity, error) {
 	t := pr.next()
 	switch t.kind {
 	case tokNum:
-		return t.value, nil
+		return plain(t.value), nil
 	case tokIdent:
-		if fn, ok := funcs[t.text]; ok {
-			return pr.parseCall(t.text, fn)
-		}
-		if v, ok := pr.p.vars[t.text]; ok {
-			return v, nil
-		}
-		if v, ok := constants[t.text]; ok {
-			return v, nil
-		}
-		return 0, fmt.Errorf("unknown name %q", t.text)
+		return pr.parseName(t)
 	case tokOp:
 		if t.text == "(" {
-			v, err := pr.parseExpr()
+			v, err := pr.parseConversion()
 			if err != nil {
-				return 0, err
+				return quantity{}, err
 			}
 			if !pr.isOp(")") {
-				return 0, errors.New(`missing ")"`)
+				return quantity{}, errors.New(`missing ")"`)
 			}
 			pr.next()
 			return v, nil
 		}
 	}
-	return 0, fmt.Errorf("unexpected %s", describe(t))
+	return quantity{}, fmt.Errorf("unexpected %s", describe(t))
 }
 
-func (pr *parser) parseCall(name string, fn function) (float64, error) {
+// parseName resolves an identifier as a function call, a variable, a constant or
+// a unit, in that order. A function name only counts as one when "(" follows,
+// which is what lets deg, rad and min be units as well: deg(pi) is a call while
+// 45 deg is an angle and 5 min is five minutes.
+func (pr *parser) parseName(t token) (quantity, error) {
+	name := t.text
+	if fn, ok := funcs[name]; ok && pr.isOp("(") {
+		return pr.parseCall(name, fn)
+	}
+	if v, ok := pr.p.vars[name]; ok {
+		return v, nil
+	}
+	if v, ok := constants[name]; ok {
+		return plain(v), nil
+	}
+	// Unit spellings are case-sensitive — kB is a kilobyte, kb a kilobit — so the
+	// name as typed gets the first try, and the folded one is the fallback.
+	for _, spelling := range []string{t.raw, name} {
+		if unit, ok := units.Literal(spelling); ok {
+			return quantity{value: 1, unit: unit}, nil
+		}
+	}
+	if _, ok := funcs[name]; ok {
+		return quantity{}, fmt.Errorf("expected \"(\" after %s", name)
+	}
+	return quantity{}, fmt.Errorf("unknown name %q", name)
+}
+
+func (pr *parser) parseCall(name string, fn function) (quantity, error) {
 	if !pr.isOp("(") {
-		return 0, fmt.Errorf("expected \"(\" after %s", name)
+		return quantity{}, fmt.Errorf("expected \"(\" after %s", name)
 	}
 	pr.next()
-	var args []float64
+	var args []quantity
 	if !pr.isOp(")") {
 		for {
-			v, err := pr.parseExpr()
+			v, err := pr.parseConversion()
 			if err != nil {
-				return 0, err
+				return quantity{}, err
 			}
 			args = append(args, v)
 			if !pr.isOp(",") {
@@ -410,11 +496,19 @@ func (pr *parser) parseCall(name string, fn function) (float64, error) {
 		}
 	}
 	if !pr.isOp(")") {
-		return 0, fmt.Errorf(`missing ")" in %s(...)`, name)
+		return quantity{}, fmt.Errorf(`missing ")" in %s(...)`, name)
 	}
 	pr.next()
 	if len(args) < fn.min || (fn.max >= 0 && len(args) > fn.max) {
-		return 0, fmt.Errorf("%s takes %s, got %d", name, fn.arity(), len(args))
+		return quantity{}, fmt.Errorf("%s takes %s, got %d", name, fn.arity(), len(args))
 	}
-	return fn.fn(pr.p.mode, args)
+	vals, unit, err := fn.apply(pr.p, name, args)
+	if err != nil {
+		return quantity{}, err
+	}
+	v, err := fn.fn(pr.p.mode, vals)
+	if err != nil {
+		return quantity{}, err
+	}
+	return quantity{value: v, unit: unit}, nil
 }

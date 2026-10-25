@@ -5,15 +5,35 @@ import (
 	"fmt"
 	"math"
 	"sort"
+
+	"gobot/internal/units"
 )
 
 // function is one callable name inside an expression, together with the number
-// of arguments it accepts and the help text that documents it.
+// of arguments it accepts, how it treats arguments that carry units, and the help
+// text that documents it.
 type function struct {
-	min int    // smallest accepted argument count
-	max int    // largest accepted argument count, or -1 for variadic
-	doc string // one-line summary shown by `calc help`
-	fn  func(mode angleMode, args []float64) (float64, error)
+	min   int    // smallest accepted argument count
+	max   int    // largest accepted argument count, or -1 for variadic
+	doc   string // one-line summary shown by `calc help`
+	fn    func(mode angleMode, args []float64) (float64, error)
+	units unitPolicy // how to unwrap quantities, or nil for plain numbers only
+}
+
+// with attaches a unit policy, which is how the table below says which functions
+// are happy to be handed a quantity such as 45 deg or 16 m^2.
+func (f function) with(policy unitPolicy) function {
+	f.units = policy
+	return f
+}
+
+// apply unwraps quantities into the plain numbers fn expects and reports the
+// unit the result should carry.
+func (f function) apply(p *Plugin, name string, args []quantity) ([]float64, units.Unit, error) {
+	if f.units == nil {
+		return plainArgs(p, name, args)
+	}
+	return f.units(p, name, args)
 }
 
 // arity describes the accepted argument count for error messages.
@@ -36,14 +56,6 @@ func (f function) arity() string {
 func unary(doc string, f func(x float64) (float64, error)) function {
 	return function{min: 1, max: 1, doc: doc, fn: func(_ angleMode, a []float64) (float64, error) {
 		return f(a[0])
-	}}
-}
-
-// unaryAngle builds a one-argument function whose input is read in the current
-// angle mode, such as sin.
-func unaryAngle(doc string, f func(x float64) float64) function {
-	return function{min: 1, max: 1, doc: doc, fn: func(m angleMode, a []float64) (float64, error) {
-		return f(m.toRadians(a[0])), nil
 	}}
 }
 
@@ -71,10 +83,18 @@ func nary(min int, doc string, f func(mode angleMode, args []float64) (float64, 
 // funcs are the names callable inside an expression. Keys are lowercase because
 // the tokenizer folds identifiers down.
 var funcs = map[string]function{
-	// Trigonometry, which follows the current angle mode.
-	"sin":  unaryAngle("sin(x) — sine of x", math.Sin),
-	"cos":  unaryAngle("cos(x) — cosine of x", math.Cos),
-	"tan":  unaryAngle("tan(x) — tangent of x", math.Tan),
+	// Trigonometry. The angle policy has already read the argument as an angle —
+	// a quantity such as 45 deg, or a bare number in the current mode — so these
+	// are handed radians.
+	"sin": unary("sin(x) — sine of x", func(x float64) (float64, error) {
+		return math.Sin(x), nil
+	}).with(anglePolicy),
+	"cos": unary("cos(x) — cosine of x", func(x float64) (float64, error) {
+		return math.Cos(x), nil
+	}).with(anglePolicy),
+	"tan": unary("tan(x) — tangent of x", func(x float64) (float64, error) {
+		return math.Tan(x), nil
+	}).with(anglePolicy),
 	"asin": unaryAngleOut("asin(x) — inverse sine of x, for -1 <= x <= 1", asinSafe),
 	"acos": unaryAngleOut("acos(x) — inverse cosine of x, for -1 <= x <= 1", acosSafe),
 	"atan": unaryAngleOut("atan(x) — inverse tangent of x", func(x float64) (float64, error) {
@@ -115,34 +135,36 @@ var funcs = map[string]function{
 		}},
 	"logb": binary("logb(x, base) — logarithm of x to the given base", logbSafe),
 
-	// Powers and roots.
-	"sqrt": unary("sqrt(x) — square root of x", sqrtSafe),
+	// Powers and roots. A root divides the exponents of a unit, and a power has
+	// to be a whole number for one.
+	"sqrt": unary("sqrt(x) — square root of x", sqrtSafe).with(rootPolicy(2)),
 	"cbrt": unary("cbrt(x) — cube root of x", func(x float64) (float64, error) {
 		return math.Cbrt(x), nil
-	}),
-	"root": binary("root(n, x) — n-th root of x", rootSafe),
+	}).with(rootPolicy(3)),
+	"root": binary("root(n, x) — n-th root of x", rootSafe).with(rootArgs),
 	"pow": binary("pow(x, y) — x raised to y, same as x^y", func(x, y float64) (float64, error) {
 		return math.Pow(x, y), nil
-	}),
+	}).with(powArgs),
 	"fact": unary("fact(n) — factorial of n, same as n!, defined for n >= 0", factorial),
 
-	// Rounding and sign.
+	// Rounding and sign, which keep whatever unit they are given.
 	"abs": unary("abs(x) — magnitude of x", func(x float64) (float64, error) {
 		return math.Abs(x), nil
-	}),
+	}).with(keepArgs),
 	"sign": unary("sign(x) — -1, 0 or 1 according to the sign of x", func(x float64) (float64, error) {
 		return sign(x), nil
-	}),
+	}).with(keepArgs),
 	"floor": unary("floor(x) — largest integer not greater than x", func(x float64) (float64, error) {
 		return math.Floor(x), nil
-	}),
+	}).with(keepArgs),
 	"ceil": unary("ceil(x) — smallest integer not less than x", func(x float64) (float64, error) {
 		return math.Ceil(x), nil
-	}),
+	}).with(keepArgs),
 	"trunc": unary("trunc(x) — x with its fractional part dropped", func(x float64) (float64, error) {
 		return math.Trunc(x), nil
-	}),
+	}).with(keepArgs),
 	"round": {min: 1, max: 2, doc: "round(x) or round(x, digits) — nearest integer, halves away from zero, or to digits places",
+		units: keepArgs,
 		fn: func(_ angleMode, a []float64) (float64, error) {
 			places := 0.0
 			if len(a) == 2 {
@@ -152,21 +174,21 @@ var funcs = map[string]function{
 			return math.Round(a[0]*shift) / shift, nil
 		}},
 
-	// Combining and remainder.
+	// Combining and remainder, where every argument has to measure the same thing.
 	"min": nary(1, "min(a, b, ...) — smallest argument", func(_ angleMode, a []float64) (float64, error) {
 		out := a[0]
 		for _, v := range a[1:] {
 			out = math.Min(out, v)
 		}
 		return out, nil
-	}),
+	}).with(sameArgs),
 	"max": nary(1, "max(a, b, ...) — largest argument", func(_ angleMode, a []float64) (float64, error) {
 		out := a[0]
 		for _, v := range a[1:] {
 			out = math.Max(out, v)
 		}
 		return out, nil
-	}),
+	}).with(sameArgs),
 	"hypot": nary(2, "hypot(a, b, ...) — Euclidean length of the arguments",
 		func(_ angleMode, a []float64) (float64, error) {
 			out := 0.0
@@ -174,16 +196,16 @@ var funcs = map[string]function{
 				out = math.Hypot(out, v)
 			}
 			return out, nil
-		}),
-	"mod": binary("mod(x, y) — remainder of x divided by y, same as x % y", modSafe),
+		}).with(sameArgs),
+	"mod": binary("mod(x, y) — remainder of x divided by y, same as x % y", modSafe).with(sameArgs),
 
 	// Angle conversion, independent of the current mode.
 	"deg": unary("deg(x) — x radians expressed in degrees", func(x float64) (float64, error) {
 		return x * 180 / math.Pi, nil
-	}),
+	}).with(radiansPolicy),
 	"rad": unary("rad(x) — x degrees expressed in radians", func(x float64) (float64, error) {
 		return x * math.Pi / 180, nil
-	}),
+	}).with(radiansPolicy),
 }
 
 // constants are the predefined names. They cannot be assigned to.
